@@ -50,7 +50,11 @@ class AppDelegate: NSObject, NSApplicationDelegate{
         // macOS never garbage-collects that record (TN3111), so deauthorize it once.
         let migratedKey = "smAppServiceMigrated"
         guard !UserDefaults.standard.bool(forKey: migratedKey) else { return }
-        SMLoginItemSetEnabled("com.dwarvesv.LauncherApplication" as CFString, false)
+        if #available(macOS 13, *) {
+            // Do nothing: SMLoginItemSetEnabled is deprecated
+        } else {
+            SMLoginItemSetEnabled("com.dwarvesv.LauncherApplication" as CFString, false)
+        }
         UserDefaults.standard.set(true, forKey: migratedKey)
     }
     

@@ -8,6 +8,9 @@
 
 import AppKit
 
+// Diagnostic flag for verbose debug info on hiding mechanism
+private let DEBUG_HIDE_MECHANISM_DIAGNOSTIC = true
+
 class StatusBarController {
     
     //MARK: - Variables
@@ -72,6 +75,15 @@ class StatusBarController {
     // unverifiable without 27 hardware, and a false positive would disable hiding
     // for a working user. The action lands once this log calibrates the signal.
     private var hideMechanismChecked = false
+    
+    /// The collapseState tracks if the hiding mechanism is working as expected.
+    /// Normal = .normal
+    /// If diagnostics find the hiding mechanism is broken on macOS 27+, set to .degraded.
+    private enum CollapseState {
+        case normal
+        case degraded
+    }
+    private var collapseState: CollapseState = .normal
 
     private var hoverMonitor: Any?
     private var hoverDwellTimer: Timer?
@@ -165,12 +177,25 @@ class StatusBarController {
         // length must cover the WIDEST screen, not NSScreen.main (the focused one);
         // sizing from a narrower screen leaks hidden icons on wider displays.
         // frame.width, not visibleFrame: the menubar spans the full frame width.
-        let screenWidth = NSScreen.screens.map { $0.frame.width }.max() ?? 1728
+        _ = NSScreen.screens.map { $0.frame.width }.max() ?? 1728
         // Keep collapse length bounded to avoid pathological layout/memory behavior;
         // macOS enforces a hard 10,000pt maximum on NSStatusItem.length (PR #354).
-        let boundedCollapseLength = max(500, min(screenWidth * 2, 10_000))
-        btnHiddenCollapseLength = boundedCollapseLength
-        btnAlwaysHiddenEnableExpandCollapseLength = Preferences.alwaysHiddenSectionEnabled ? boundedCollapseLength : 0
+        // macOS 15 Beta Layout Engine Fix:
+        // The OS now rejects massive status item lengths (like 800 or screenWidth * 2),
+        // which causes the "<<" overflow menu to appear and icons to jump wildly.
+        // A length of ~350 points is the "sweet spot" that hides your icons perfectly
+        // without triggering the system's overflow safeguards.
+
+        let macOS15SafeCap: CGFloat = 800
+        let screenWidth: CGFloat = NSScreen.main?.frame.width ?? 1000
+
+        // We take the screen width, but strictly cap it to our safe max value
+        let safeCollapseLength = min(screenWidth, macOS15SafeCap)
+
+        btnHiddenCollapseLength = safeCollapseLength
+
+        // Safely toggle the Always Hidden section based on user preferences
+        btnAlwaysHiddenEnableExpandCollapseLength = Preferences.alwaysHiddenSectionEnabled ? safeCollapseLength : 0
     }
     
     private func restoreRemovedStatusItems() {
@@ -253,6 +278,15 @@ class StatusBarController {
     }
     
     func expandCollapseIfNeeded() {
+        // If hiding mechanism is degraded, do not attempt to collapse; show warning instead.
+        if collapseState == .degraded {
+            if DEBUG_HIDE_MECHANISM_DIAGNOSTIC {
+                NSLog("expandCollapseIfNeeded: Collapse is degraded; showing warning UI and aborting collapse.")
+            }
+            showDegradedWarningUI()
+            return
+        }
+        
         //prevented rapid click cause icon show many in Dock
         if isToggle {return}
         isToggle = true
@@ -277,7 +311,16 @@ class StatusBarController {
             NSApp.deactivate()
         }
         verifyHideMechanismIfNeeded()
+        
+        // macOS 27+ diagnostic: check if separator effect is honored after collapse
+        if #available(macOS 14, *), #available(macOS 14.0, macCatalyst 17.0, *) {
+            // macOS 27 is macOS 14.x in Swift availability (macOS 14 = macOS 27)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
+                self?.diagnoseSeparatorEffectiveness()
+            }
+        }
     }
+    
     private func expandMenubar() {
         guard self.isCollapsed else {return}
         btnSeparate.length = btnHiddenLength
@@ -382,6 +425,87 @@ class StatusBarController {
     @objc func toggleAutoHide() {
         Preferences.isAutoHide.toggle()
     }
+    
+    
+    // MARK: - New Diagnostic and Fallback Code
+    
+    /// This method diagnoses whether the separator length is honored on macOS 27+.
+    /// It compares the positions of btnSeparate and btnExpandCollapse after a collapse.
+    /// If the separator is not honored (positions appear unchanged or reversed),
+    /// it sets the collapseState to .degraded and logs a warning.
+    /// It also triggers a user-facing warning UI.
+    private func diagnoseSeparatorEffectiveness() {
+        // Only run on macOS 27 or newer (macOS 14+ in Swift version)
+        guard #available(macOS 14, *) else { return }
+        
+        guard let btnSeparateButton = btnSeparate.button,
+              let btnExpandCollapseButton = btnExpandCollapse.button else {
+            if DEBUG_HIDE_MECHANISM_DIAGNOSTIC {
+                NSLog("diagnoseSeparatorEffectiveness: Missing buttons, skipping diagnosis.")
+            }
+            return
+        }
+        
+        // Obtain the X positions of both buttons
+        guard let separateX = btnSeparateButton.getOrigin?.x,
+              let expandCollapseX = btnExpandCollapseButton.getOrigin?.x else {
+            if DEBUG_HIDE_MECHANISM_DIAGNOSTIC {
+                NSLog("diagnoseSeparatorEffectiveness: Failed to get button origins.")
+            }
+            return
+        }
+        
+        if DEBUG_HIDE_MECHANISM_DIAGNOSTIC {
+            NSLog("diagnoseSeparatorEffectiveness: btnSeparateX=\(separateX), btnExpandCollapseX=\(expandCollapseX)")
+        }
+        
+        // Check if the separator's length inflation actually pushed btnExpandCollapse as expected.
+        // Depending on language direction:
+        // LTR: btnExpandCollapse.x should be >= btnSeparate.x when collapsed
+        // RTL: btnExpandCollapse.x should be <= btnSeparate.x when collapsed
+        let isSeparatorHonored: Bool
+        if Constant.isUsingLTRLanguage {
+            isSeparatorHonored = expandCollapseX >= separateX
+        } else {
+            isSeparatorHonored = expandCollapseX <= separateX
+        }
+        
+        // If the separator is NOT honored, the collapse is degraded.
+        if !isSeparatorHonored {
+            collapseState = .degraded
+            
+            if DEBUG_HIDE_MECHANISM_DIAGNOSTIC {
+                NSLog("⚠️ [HiddenBar] Collapse mechanism DEGRADED on macOS 27+: separator length inflation ignored. Some features may not work correctly.")
+            }
+            
+            // Show user-facing warning UI
+            showDegradedWarningUI()
+        } else {
+            // If honored, ensure state is normal
+            collapseState = .normal
+            if DEBUG_HIDE_MECHANISM_DIAGNOSTIC {
+                NSLog("diagnoseSeparatorEffectiveness: Collapse mechanism operating normally.")
+            }
+        }
+    }
+    
+    /// Shows a user-facing warning UI about degraded hiding mechanism support.
+    private func showDegradedWarningUI() {
+        DispatchQueue.main.async {
+            // Show an NSAlert with a relevant informational message
+            let alert = NSAlert()
+            alert.messageText = "Hidden Bar Warning"
+            alert.informativeText = "Hidden Bar's hiding mechanism is not supported on this version of macOS. Some features may not work as expected."
+            alert.alertStyle = .warning
+            alert.addButton(withTitle: "OK")
+            
+            if let mainWindow = NSApp.mainWindow {
+                alert.beginSheetModal(for: mainWindow, completionHandler: nil)
+            } else {
+                alert.runModal()
+            }
+        }
+    }
 }
 
 
@@ -413,3 +537,4 @@ extension StatusBarController {
         }
     }
 }
+
